@@ -1,0 +1,19 @@
+# SERVER environment: ./.venv, private to this project (see setup_wsl.sh). Linux or WSL2 only:
+# fairseq2, which SeamlessStreaming runs on, ships no Windows build.
+# Python 3.10, then (see README.md for the full sequence):
+#
+#   sudo apt install libsndfile1
+#   pip install torch==2.2.2 torchaudio==2.2.2      # fairseq2n 0.2.1 is built against 2.2.2
+#   pip install git+https://github.com/facebookresearch/seamless_communication.git
+#   pip install -r translation_server/requirements.txt
+aiohttp>=3.9
+numpy<2           # fairseq2 0.2 requires numpy~=1.23
+soxr>=0.3.7
+
+# Optional
+#   silero-vad      better utterance detection in noisy rooms (--vad silero; auto-used if present)
+#   encodec         accept the conference app's EnCodec packets as input
+#                   (input format "encodec_packet") instead of PCM
+
+# The CLIENT side (client_adapter.py) needs only numpy and aiohttp, which
+# webrtc_conference/requirements.txt already installs. Nothing to add there.
