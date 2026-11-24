@@ -64,6 +64,8 @@ class _Utterance:
     t_first_out: Optional[float] = None
     t_last_out: Optional[float] = None
     out_samples: int = 0                # translated samples (16 kHz)
+    src_t_ms: Optional[int] = None      # sender-clock time the speech began (conference)
+    sent_out: int = 0                   # translated samples handed to the sink (output rate)
     source_text: str = ""
     target_text: str = ""
 
@@ -105,6 +107,11 @@ class Session:
         self._pump_task: Optional[asyncio.Task] = None
         self.started = False
         self.closed = False
+        # Conference mode: translated audio goes to this coroutine, as
+        # sink(pcm_float32_at_output_rate, sender_clock_t_ms) -- and sink(None, None)
+        # when an utterance ends -- instead of out through the WebSocket.
+        self.audio_sink: Optional[Callable[[Optional[np.ndarray], Optional[int]], Awaitable]] = None
+        self._chunk_end_t_ms: Optional[int] = None
         # stats
         self.received_s = 0.0
         self.utterances_done = 0
@@ -218,7 +225,10 @@ class Session:
 
     # ── audio in ─────────────────────────────────────────────────────────────
 
-    async def feed(self, data: bytes):
+    async def feed(self, data: bytes, t_ms: Optional[int] = None):
+        """`t_ms`: the sender's clock at the first sample of `data`. It lets the
+        translated speech be stamped with the moment its source was spoken, so
+        the listener can line the speaker's video up with it."""
         self._require_started()
         if self._in_fmt == wire.ENCODEC_PACKET:
             try:
@@ -231,6 +241,8 @@ class Session:
         if pcm.size == 0:
             return
         self.received_s += pcm.size / self._in_rate
+        if t_ms is not None:
+            self._chunk_end_t_ms = (t_ms + round(pcm.size * 1000 / self._in_rate)) & 0xFFFFFFFF
         self._apply(self._endpointer.push(self._in_resampler(pcm)))
 
     def _apply(self, events: list):
@@ -243,6 +255,11 @@ class Session:
                 self._idle.clear()
                 self._trim_backlog()
             elif kind == "audio" and self._open is not None:
+                if self._open.src_t_ms is None and self._chunk_end_t_ms is not None:
+                    # The first audio of an utterance is its pre-roll, which ends
+                    # with the chunk just fed: the speech began that far before it.
+                    self._open.src_t_ms = (self._chunk_end_t_ms
+                                           - round(val.size * 1000 / MODEL_RATE)) & 0xFFFFFFFF
                 self._open.append(val)
             elif kind == "end" and self._open is not None:
                 utt, self._open = self._open, None
@@ -334,11 +351,20 @@ class Session:
         utt.t_first_out = utt.t_first_out or now
         utt.t_last_out = now
         utt.out_samples += model_samples
+        if self.audio_sink is not None:
+            t_ms = None
+            if utt.src_t_ms is not None:
+                t_ms = (utt.src_t_ms + round(utt.sent_out * 1000 / self._out_rate)) & 0xFFFFFFFF
+            utt.sent_out += pcm.size
+            await self.audio_sink(pcm, t_ms)
+            return
         await self._send_bytes(wire.pcm_to_bytes(pcm, self._out_fmt))
 
     async def _finish(self, utt: _Utterance):
         if utt.ctx is not None:
             self.engine.release(utt.ctx)
+        if self.audio_sink is not None:
+            await self.audio_sink(None, None)           # utterance over: flush the packetizer
         self.utterances_done += 1
         now = time.monotonic()
         t_end = utt.t_end if utt.t_end is not None else now
@@ -358,6 +384,8 @@ class Session:
     async def _finish_dropped(self, utt: _Utterance):
         if utt.ctx is not None:
             self.engine.release(utt.ctx)
+        if self.audio_sink is not None and utt.sent_out:
+            await self.audio_sink(None, None)
         if utt.announced or utt.reason not in ("too_short",):
             await self.send_event("dropped", utterance=utt.id, reason=utt.reason or "dropped")
 

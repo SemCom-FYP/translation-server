@@ -148,6 +148,21 @@ translated audio) and `end_offset_ms` (speech ended → last translated audio).
 They depend on the GPU, the options above, and how many streams share it.
 Measure on your own hardware with `stream_file`.
 
+## Conference voice relay (`/v1/conf`)
+
+The neural conference sends all its audio here as Opus. Participants join a room; for every
+speaker/listener pair the server either forwards the Opus packet untouched or, when the
+listener asked for another language than the speaker speaks, translates it and re-encodes
+it as Opus. Packets keep the speaker's capture timestamp (translated ones are stamped with
+when their source speech began), so the client can keep video in sync. Needs `pip install
+PyOgg` and, on Linux/WSL, `sudo apt install libopus0`. Audio starts on the WebSocket and moves to an unreliable WebRTC datachannel (UDP, via aiortc;
+`--stun` sets the STUN servers) when the client offers one; without aiortc or UDP it stays on the
+WebSocket. Protocol: `src/conference.py`.
+
+```
+ws://<host>:8770/v1/conf?room=demo&peer=<id>&name=<name>&speaks=en[&hear=es][&token=...]
+```
+
 ## Protocol
 
 One WebSocket per voice at `ws://<host>:8770/v1/stream`. The full reference is

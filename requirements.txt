@@ -9,6 +9,8 @@
 aiohttp>=3.9
 numpy<2           # fairseq2 0.2 requires numpy~=1.23
 soxr>=0.3.7
+aiortc>=1.9.0      # optional: WebRTC (UDP) datachannel for the conference voice path; without it voice stays on the WebSocket
+PyOgg>=0.6.14a1   # Opus for the conference voice path (needs libopus: sudo apt install libopus0)
 
 # Optional
 #   silero-vad      better utterance detection in noisy rooms (--vad silero; auto-used if present)

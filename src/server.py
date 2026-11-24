@@ -29,24 +29,29 @@ from typing import Optional
 from aiohttp import WSMsgType, web
 
 from . import wire
+from .conference import CONF_PATH, ConferenceError, ConferenceRoom, Member
 from .room import Room, RoomError
 from .session import ProtocolError, Session, SessionOptions
 
 log = logging.getLogger("translation.server")
 
 DEFAULT_PORT = 8770
+DEFAULT_STUN = "stun:stun.l.google.com:19302"
 CALL_PATH = "/v1/call"
 
 
 class TranslationServer:
     def __init__(self, engine, options: Optional[SessionOptions] = None,
-                 token: Optional[str] = None, max_sessions: int = 16):
+                 token: Optional[str] = None, max_sessions: int = 16,
+                 ice_urls: Optional[list] = None):
         self.engine = engine
         self.options = options or SessionOptions()
         self.token = token
         self.max_sessions = max_sessions
         self.sessions: dict = {}
         self.rooms: dict = {}
+        self.conf_rooms: dict = {}
+        self.ice_urls = ice_urls if ice_urls is not None else [DEFAULT_STUN]
         self.started_at = time.time()
 
     def build_app(self) -> web.Application:
@@ -55,8 +60,77 @@ class TranslationServer:
         app.router.add_get("/health", self.health)
         app.router.add_get(wire.WS_PATH, self.stream)
         app.router.add_get(CALL_PATH, self.call)
+        app.router.add_get(CONF_PATH, self.conference)
         app.on_shutdown.append(self._on_shutdown)
         return app
+
+    async def conference(self, request):
+        """The neural conference's voice path: Opus in, Opus out, translated per listener."""
+        if not self._authorised(request):
+            return web.Response(status=401, text="bad or missing token\n")
+        q = request.query
+        peer_id = q.get("peer", "")
+        hear = q.get("hear") or None
+        if not peer_id:
+            return web.Response(status=400, text="peer= is required\n")
+        if hear and self.engine.resolve_lang(hear) is None:
+            return web.Response(status=400, text=f"cannot speak {hear!r}\n")
+        room_name = q.get("room", "demo")[:64]
+        ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1 << 20)
+        await ws.prepare(request)
+        room = self.conf_rooms.get(room_name)
+        if room is None:
+            room = self.conf_rooms[room_name] = ConferenceRoom(room_name, self)
+        member = Member(peer_id=peer_id[:64], name=(q.get("name") or peer_id)[:32],
+                        speaks=q.get("speaks", ""), hear=hear, ws=ws)
+        joined = False
+        consumer = None
+        try:
+            try:
+                await room.join(member)
+                joined = True
+            except ConferenceError as exc:
+                await ws.send_str(wire.dumps("error", code=exc.code, message=str(exc)))
+                return ws
+            # Audio from either transport lands in one queue and is handled in order.
+            member.inbox = asyncio.Queue(maxsize=200)
+
+            async def consume():
+                while True:
+                    await room.on_audio(member, await member.inbox.get())
+
+            consumer = asyncio.create_task(consume())
+            async for msg in ws:
+                if msg.type == WSMsgType.BINARY:
+                    member.enqueue(msg.data)
+                elif msg.type == WSMsgType.TEXT:
+                    try:
+                        ctl = wire.loads(msg.data)
+                    except ValueError:
+                        continue
+                    kind = ctl["type"]
+                    if kind == "configure":
+                        await room.configure(member, ctl.get("hear") or None)
+                    elif kind == "rtc_offer":
+                        await room.accept_rtc(member, str(ctl.get("sdp", "")))
+                    elif kind == "ping":
+                        await member.send_event("pong", t=ctl.get("t"))
+                    elif kind == "leave":
+                        break
+                elif msg.type == WSMsgType.ERROR:
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if consumer is not None:
+                consumer.cancel()
+            if joined:
+                await room.leave(member)
+            if not room.members and self.conf_rooms.get(room_name) is room:
+                del self.conf_rooms[room_name]
+            if not ws.closed:
+                await ws.close()
+        return ws
 
     async def call(self, request):
         """A person in a call room: their mic in, the others' translated voices out."""
@@ -116,6 +190,8 @@ class TranslationServer:
             "target_langs": self.engine.target_langs,
             "sessions": len(self.sessions),
             "rooms": {name: [p.name for p in r.peers.values()] for name, r in self.rooms.items()},
+            "conference": {name: [m.name for m in r.members.values()]
+                           for name, r in self.conf_rooms.items()},
             "max_sessions": self.max_sessions,
             "uptime_s": round(time.time() - self.started_at),
         })
@@ -226,6 +302,9 @@ def parse_args(argv=None):
                    help="shared secret clients must send (?token= or Bearer header); "
                         "default $TRANSLATION_TOKEN, unset = open")
     g.add_argument("--max-sessions", type=int, default=16)
+    g.add_argument("--stun", nargs="*", default=[DEFAULT_STUN],
+                   help="STUN URLs for the conference's WebRTC voice channel "
+                        "(pass with no values to disable)")
 
     g = p.add_argument_group("model")
     g.add_argument("--mock", action="store_true",
@@ -282,7 +361,7 @@ def main(argv=None):
         soft_max_s=min(10.0, args.max_utterance_s * 2 / 3),
         hard_max_s=args.max_utterance_s)
     server = TranslationServer(engine, options, token=args.token,
-                               max_sessions=args.max_sessions)
+                               max_sessions=args.max_sessions, ice_urls=args.stun)
     print(f"Translation server ({engine.name}, {len(engine.target_langs)} output "
           f"languages) on ws://{args.host}:{args.port}{wire.WS_PATH}")
     web.run_app(server.build_app(), host=args.host, port=args.port,
